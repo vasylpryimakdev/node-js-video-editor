@@ -1,13 +1,17 @@
 const path = require("node:path");
+const cluster = require("node:cluster");
 const crypto = require("node:crypto");
 const fs = require("node:fs/promises");
 const { pipeline } = require("node:stream/promises");
 const util = require("../../lib/util");
 const DB = require("../DB");
 const FF = require("../../lib/FF");
-const JobQueue = require("../../lib/JobQueue");
 
-const jobs = new JobQueue();
+let jobs;
+if (cluster.isPrimary) {
+  const JobQueue = require("../../lib/JobQueue");
+  jobs = new JobQueue();
+}
 
 // Return the list of all the videos that a logged in user has uploaded
 const getVideos = (req, res, handleErr) => {
@@ -118,12 +122,19 @@ const resizeVideo = async (req, res, handleErr) => {
   video.resizes[`${width}x${height}`] = { processing: true };
   DB.save();
 
-  jobs.enqueue({
-    type: "resize",
-    videoId,
-    width,
-    height,
-  });
+  if (cluster.isPrimary) {
+    jobs.enqueue({
+      type: "resize",
+      videoId,
+      width,
+      height,
+    });
+  } else {
+    process.send({
+      messageType: "new-resize",
+      data: { videoId, width, height },
+    });
+  }
 
   res.status(200).json({
     status: "success",
@@ -179,26 +190,29 @@ const getVideoAsset = async (req, res, handleErr) => {
       break;
   }
 
-  // Grab the file size
-  const stat = await file.stat();
+  try {
+    // Grab the file size
+    const stat = await file.stat();
 
-  const fileStream = file.createReadStream();
+    const fileStream = file.createReadStream();
 
-  if (type !== "thumbnail") {
-    // Set a header to prompt for download
-    res.setHeader("Content-Disposition", `attachment; filename=${filename}`);
+    if (type !== "thumbnail") {
+      // Set a header to prompt for download
+      res.setHeader("Content-Disposition", `attachment; filename=${filename}`);
+    }
+
+    // Set the Content-Type header based on the file type
+    res.setHeader("Content-Type", mimeType);
+    // Set the Content-Length to the size of the file
+    res.setHeader("Content-Length", stat.size);
+
+    res.status(200);
+
+    await pipeline(fileStream, res);
+    file.close();
+  } catch (e) {
+    console.log(e);
   }
-
-  // Set the Content-Type header based on the file type
-  res.setHeader("Content-Type", mimeType);
-  // Set the Content-Length to the size of the file
-  res.setHeader("Content-Length", stat.size);
-
-  res.status(200);
-
-  await pipeline(fileStream, res);
-
-  file.close();
 };
 
 const controller = {
